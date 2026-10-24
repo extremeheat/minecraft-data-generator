@@ -1,58 +1,111 @@
 const cp = require('child_process')
-const gh = require('gh-helpers')()
-const bump = require('../../tools/newVersion')
-const exec = (a, o) => {
-  console.log('$', a)
-  cp.execSync(a, { stdio: 'inherit', ...o })
+const fs = require('fs')
+const { runQueue, writeState } = require('./bump-state')
+
+const exec = (...args) => {
+  console.log('$ git', ...args)
+  cp.execFileSync('git', args, { stdio: 'inherit' })
 }
 
-const generateBody = (newVersion, issueNo, prNo) => `
-This automated PR sets up the relevant boilerplate for Minecraft version ${newVersion}.
+const generateBody = ({ version, issue, pr }) => `
+This automated PR sets up the relevant boilerplate for Minecraft version ${version}.
 
 Links:
-- Issue: ${issueNo ? `https://github.com/PrismarineJS/minecraft-data/issues/${issueNo}` : 'N/A'}
-- PR: ${prNo ? `https://github.com/PrismarineJS/minecraft-data/pull/${prNo}` : 'N/A'}
+- Issue: ${issue ? `https://github.com/PrismarineJS/minecraft-data/issues/${issue}` : 'N/A'}
+- PR: ${pr ? `https://github.com/PrismarineJS/minecraft-data/pull/${pr}` : 'N/A'}
 
-If the PR is passing, it will automatically send the generated artifacts to PrismarineJS/minecraft-data${prNo ? `#${prNo}` : ''}.
+If the PR is passing, it will automatically send the generated artifacts to PrismarineJS/minecraft-data${pr ? `#${pr}` : ''}.
 
 If the PR is **not** passing:
 * You can help contribute to this PR by opening a PR against this <code>bump</code> branch instead of <code>main</code>.
 `
 
-module.exports = async ([newVersion], helpers) => {
-  const existingPr = await gh.findPullRequest({ titleIncludes: '🎈', status: 'open' })
-  if (existingPr) {
-    console.warn('There is already an open PR; cannot create a new one until that one is closed.', existingPr)
-    await gh.comment(existingPr.number, `Cannot open new PR for version '${newVersion}' as this one is already open. Maintainers: Once this is merged, please manually re-run the update workflow for the new version (${newVersion}).`)
-    return
-  }
-  try {
-    bump(newVersion)
-    try { exec('git branch -D bump') } catch (e) { console.log('No existing branch to delete; ok.') }
-    exec('git checkout -b bump')
-    exec('git config user.name "github-actions[bot]"')
-    exec('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"')
-    exec('git add mc versions.json')
-    exec('git commit -m "Add version ' + newVersion + '"')
-    exec('git push origin bump --force')
-    const pr = await gh.createPullRequest(
-      '🎈 Add version ' + newVersion, // special marker
-      generateBody(newVersion, process.env.MCDATA_ISSUE_NO, process.env.MCDATA_PULL_NO),
-      'bump',
-      'main'
-    )
-    console.log('Pull request created:', pr.html_url)
-  } catch (error) {
-    console.log('Error bumping version:', error)
-    return helpers.reply('Error bumping version: ' + error.message)
+function validateRequest (request) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(request.version)) throw new Error('Invalid Minecraft version')
+  for (const field of ['pr', 'issue']) {
+    if (request[field] && !/^\d+$/.test(request[field])) throw new Error(`Invalid minecraft-data ${field} number`)
   }
 }
 
-if (require.main === module) {
-  const args = process.argv.slice(2)
-  if (args.length !== 1) {
-    console.error('Usage: node bump.js <newVersion>')
-    process.exit(1)
+function isBumpBranch (pr, repository) {
+  return pr.head?.ref === 'bump' && pr.head?.repo?.full_name === repository &&
+    pr.base?.ref === 'main'
+}
+
+function isBumpPull (pr, repository) {
+  return isBumpBranch(pr, repository) && pr.title.startsWith('🎈')
+}
+
+// Use the paginated pulls endpoint: search results can lag behind PR creation,
+// which matters when recovering a handoff, and must not filter by token owner.
+async function listBumpPulls (repository) {
+  const pulls = []
+  for (let page = 1; ; page++) {
+    const params = new URLSearchParams({ state: 'all', base: 'main', head: `${repository.split('/')[0]}:bump`, per_page: '100', page: String(page) })
+    const response = await fetch(`https://api.github.com/repos/${repository}/pulls?${params}`, {
+      headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
+    })
+    if (!response.ok) throw new Error(`Cannot list bump PRs: ${response.status}`)
+    const batch = await response.json()
+    pulls.push(...batch.filter(pr => isBumpBranch(pr, repository)))
+    if (batch.length < 100) return pulls
   }
-  module.exports(args, { reply: console.log })
+}
+
+module.exports = async ([newVersion], helpers) => {
+  const gh = require('gh-helpers')()
+  const repository = process.env.GITHUB_REPOSITORY
+  if (!repository) throw new Error('GITHUB_REPOSITORY is required')
+  const request = newVersion
+    ? { version: newVersion, pr: process.env.MCDATA_PULL_NO || '', issue: process.env.MCDATA_ISSUE_NO || '' }
+    : null
+  if (request) validateRequest(request)
+
+  try {
+    await runQueue({
+      supported: require('../../versions.json'),
+      request,
+      api: {
+        list: async () => (await listBumpPulls(repository)).filter(pr => isBumpPull(pr, repository)),
+        get: number => gh.getPullRequest(number),
+        update: (number, body) => gh.updatePull(number, { body }),
+        create: async (next, state) => {
+          validateRequest(next)
+          // Never reset a branch that still has an open PR with contributor work.
+          if ((await listBumpPulls(repository)).some(pr => pr.state === 'open')) throw new Error('A bump PR is already open')
+          require('../../tools/newVersion')(next.version)
+          exec('checkout', '-B', 'bump')
+          exec('config', 'user.name', 'github-actions[bot]')
+          exec('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          exec('add', 'mc', 'versions.json')
+          exec('commit', '-m', `Add version ${next.version}`)
+          exec('push', 'origin', 'bump', '--force')
+          const pr = await gh.createPullRequest(`🎈 Add version ${next.version}`, writeState(generateBody(next), state), 'bump', 'main')
+          console.log('Pull request created:', pr.url)
+          return pr
+        }
+      }
+    })
+  } catch (error) {
+    await helpers.reply('Error bumping version: ' + error.message)
+    throw error
+  }
+}
+
+module.exports.isBumpPull = isBumpPull
+
+if (require.main === module) {
+  const event = process.env.GITHUB_EVENT_PATH ? JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')) : {}
+  const closed = process.env.GITHUB_EVENT_NAME === 'pull_request_target' && event.action === 'closed' &&
+    isBumpPull(event.pull_request, process.env.GITHUB_REPOSITORY)
+  const version = process.argv[2] || process.env.MC_VERSION
+  if (closed || version) {
+    module.exports([closed ? undefined : version], { reply: console.error }).catch(error => {
+      console.error(error)
+      process.exitCode = 1
+    })
+  } else {
+    console.error('Usage: node bump.js <newVersion> (or a bump PR closed event)')
+    process.exitCode = 1
+  }
 }
