@@ -6,9 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'What new version is like `1.21.6`'
-        required: true
-        default: '1.21.6'
+        description: 'New version (leave empty to advance the saved queue)'
+        required: false
       pr_number:
         description: 'What is the relevant minecraft-data PR number?'
         required: false
@@ -38,9 +37,16 @@ jobs:
         with:
           node-version: 22
       - run: npm install # install gh-helpers
-      - run: node .github/commands/bump.js
+      - name: Queue a version request
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        run: node .github/commands/bump.js "$MC_VERSION"
         env:
           MC_VERSION: ${{ github.event.inputs.version }}
           MCDATA_PULL_NO: ${{ github.event.inputs.pr_number }}
           MCDATA_ISSUE_NO: ${{ github.event.inputs.issue_number }}
+          GITHUB_TOKEN: ${{ secrets.PAT_PASSWORD }}
+      - name: Advance the saved queue
+        if: github.event_name == 'pull_request_target' || github.event.inputs.version == ''
+        run: node .github/commands/bump.js --advance
+        env:
           GITHUB_TOKEN: ${{ secrets.PAT_PASSWORD }}

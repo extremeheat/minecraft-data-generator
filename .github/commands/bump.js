@@ -1,8 +1,7 @@
 const cp = require('child_process')
-const fs = require('fs')
 const { runQueue, writeState } = require('./bump-state')
 
-const exec = (...args) => {
+const git = (...args) => {
   console.log('$ git', ...args)
   cp.execFileSync('git', args, { stdio: 'inherit' })
 }
@@ -28,34 +27,20 @@ function validateRequest (request) {
 }
 
 function isBumpBranch (pr, repository) {
-  return pr.head?.ref === 'bump' && pr.head?.repo?.full_name === repository &&
-    pr.base?.ref === 'main'
+  return pr.headBranch === 'bump' && pr.headRepo === repository && pr.targetBranch === 'main'
 }
 
 function isBumpPull (pr, repository) {
   return isBumpBranch(pr, repository) && pr.title.startsWith('🎈')
 }
 
-// Use the paginated pulls endpoint: search results can lag behind PR creation,
-// which matters when recovering a handoff, and must not filter by token owner.
-async function listBumpPulls (repository) {
-  const pulls = []
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ state: 'all', base: 'main', head: `${repository.split('/')[0]}:bump`, per_page: '100', page: String(page) })
-    const response = await fetch(`https://api.github.com/repos/${repository}/pulls?${params}`, {
-      headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
-    })
-    if (!response.ok) throw new Error(`Cannot list bump PRs: ${response.status}`)
-    const batch = await response.json()
-    pulls.push(...batch.filter(pr => isBumpBranch(pr, repository)))
-    if (batch.length < 100) return pulls
-  }
-}
-
 module.exports = async ([newVersion], helpers) => {
   const gh = require('gh-helpers')()
   const repository = process.env.GITHUB_REPOSITORY
   if (!repository) throw new Error('GITHUB_REPOSITORY is required')
+  const listBumpPulls = async () => (await gh.listPullRequests({
+    state: 'all', head: `${repository.split('/')[0]}:bump`, base: 'main'
+  })).filter(pr => isBumpBranch(pr, repository))
   const request = newVersion
     ? { version: newVersion, pr: process.env.MCDATA_PULL_NO || '', issue: process.env.MCDATA_ISSUE_NO || '' }
     : null
@@ -66,20 +51,20 @@ module.exports = async ([newVersion], helpers) => {
       supported: require('../../versions.json'),
       request,
       api: {
-        list: async () => (await listBumpPulls(repository)).filter(pr => isBumpPull(pr, repository)),
+        list: async () => (await listBumpPulls()).filter(pr => isBumpPull(pr, repository)),
         get: number => gh.getPullRequest(number),
         update: (number, body) => gh.updatePull(number, { body }),
         create: async (next, state) => {
           validateRequest(next)
           // Never reset a branch that still has an open PR with contributor work.
-          if ((await listBumpPulls(repository)).some(pr => pr.state === 'open')) throw new Error('A bump PR is already open')
+          if ((await listBumpPulls()).some(pr => pr.state === 'open')) throw new Error('A bump PR is already open')
           require('../../tools/newVersion')(next.version)
-          exec('checkout', '-B', 'bump')
-          exec('config', 'user.name', 'github-actions[bot]')
-          exec('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
-          exec('add', 'mc', 'versions.json')
-          exec('commit', '-m', `Add version ${next.version}`)
-          exec('push', 'origin', 'bump', '--force')
+          git('checkout', '-B', 'bump')
+          git('config', 'user.name', 'github-actions[bot]')
+          git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          git('add', 'mc', 'versions.json')
+          git('commit', '-m', `Add version ${next.version}`)
+          git('push', 'origin', 'bump', '--force')
           const pr = await gh.createPullRequest(`🎈 Add version ${next.version}`, writeState(generateBody(next), state), 'bump', 'main')
           console.log('Pull request created:', pr.url)
           return pr
@@ -95,17 +80,14 @@ module.exports = async ([newVersion], helpers) => {
 module.exports.isBumpPull = isBumpPull
 
 if (require.main === module) {
-  const event = process.env.GITHUB_EVENT_PATH ? JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')) : {}
-  const closed = process.env.GITHUB_EVENT_NAME === 'pull_request_target' && event.action === 'closed' &&
-    isBumpPull(event.pull_request, process.env.GITHUB_REPOSITORY)
-  const version = process.argv[2] || process.env.MC_VERSION
-  if (closed || version) {
-    module.exports([closed ? undefined : version], { reply: console.error }).catch(error => {
+  const args = process.argv.slice(2)
+  if (args.length === 1) {
+    module.exports([args[0] === '--advance' ? undefined : args[0]], { reply: console.error }).catch(error => {
       console.error(error)
       process.exitCode = 1
     })
   } else {
-    console.error('Usage: node bump.js <newVersion> (or a bump PR closed event)')
+    console.error('Usage: node bump.js <newVersion> | --advance')
     process.exitCode = 1
   }
 }

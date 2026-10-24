@@ -163,14 +163,11 @@ test('failed state write creates nothing and a repeated dispatch can be saved', 
   assert.equal(f.created.length, 1)
 })
 
-test('bootstraps a legacy PR even if its title was renamed', async () => {
-  const f = fixture([{
-    number: 77,
-    title: '🎈 Support 26.2 and fix various issues',
-    body: 'This automated PR sets up the relevant boilerplate for Minecraft version 26.2.',
-    state: 'closed'
-  }])
-  await f.run(request('26.3'))
+test('advances the explicitly migrated current PR', async () => {
+  const migrated = pull(77, '26.2', [request('26.3')], 'closed')
+  migrated.title = '🎈 Support 26.2 and fix various issues'
+  const f = fixture([migrated])
+  await f.run()
   assert.equal(f.state(77).successor, 78)
   assert.deepEqual(f.state(78), initialState('26.3', [], 77))
 })
@@ -184,16 +181,24 @@ test('malformed state fails without writes or creation', async () => {
   assert.equal(f.updates.length, 0)
 })
 
-test('an older PR without a body can acquire queue state from its title', async () => {
+test('an open PR without state requires explicit initialization', async () => {
   const f = fixture([{ number: 1, title: '🎈 Add version 26.3', body: null, state: 'open' }])
-  await f.run(request('26.4'))
-  assert.deepEqual(f.state(1), initialState('26.3', [request('26.4')]))
+  await assert.rejects(f.run(request('26.4')), /Initialize WF_STATE on bump PR #1/)
+  assert.equal(f.created.length, 0)
+  assert.equal(f.updates.length, 0)
+})
+
+test('closed PRs without state are ignored without parsing their text', async () => {
+  const f = fixture([{ number: 1, title: '🎈 Old PR with arbitrary title', body: null, state: 'closed' }])
+  await f.run(request('26.3'))
+  assert.deepEqual(f.state(2), initialState('26.3'))
+  assert.equal(f.updates.length, 0)
 })
 
 test('only the repository bump branch targeting main is eligible', () => {
-  const pr = { head: { ref: 'bump', repo: { full_name: 'owner/repo' } }, base: { ref: 'main' }, title: '🎈 Add version 26.3' }
+  const pr = { headBranch: 'bump', headRepo: 'owner/repo', targetBranch: 'main', title: '🎈 Add version 26.3' }
   assert.equal(isBumpPull(pr, 'owner/repo'), true)
   assert.equal(isBumpPull(pr, 'fork/repo'), false)
-  assert.equal(isBumpPull({ ...pr, head: { ...pr.head, ref: 'fix' } }, 'owner/repo'), false)
-  assert.equal(isBumpPull({ ...pr, base: { ref: 'bump' } }, 'owner/repo'), false)
+  assert.equal(isBumpPull({ ...pr, headBranch: 'fix' }, 'owner/repo'), false)
+  assert.equal(isBumpPull({ ...pr, targetBranch: 'bump' }, 'owner/repo'), false)
 })

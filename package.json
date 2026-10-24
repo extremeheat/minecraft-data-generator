@@ -11,7 +11,7 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "gh-helpers": "^0.3.5",
+    "gh-helpers": "github:extremeheat/gh-helpers#6020cbc56ca4152401398fc024347d03b455b81b",
     "standard": "^17.1.2"
   }
 }

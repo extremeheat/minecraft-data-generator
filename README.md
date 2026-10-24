@@ -47,10 +47,13 @@ that was already created is recovered without overwriting its contributor work.
 The dispatch and closure handlers share a concurrency group to serialize updates.
 No routine minecraft-data lookup is needed.
 
-Existing PRs gain state when next handled. Previously discarded requests must
-be dispatched once with their original version and upstream PR/issue numbers.
-For the pending 26.3 request, those inputs are `26.3`, PR `1300`, and issue `1299`
-in the `handle-mcdata-update` workflow after this change reaches `main`.
+The workflow explicitly invokes `bump.js <version>` for new requests and
+`bump.js --advance` to continue the saved queue. To retry or bootstrap a saved
+queue manually, run `handle-mcdata-update` with its version input empty.
+
+PRs created before this system need a one-time `WF_STATE` initialization if they
+have a queue to carry forward. Old closed PRs without state are ignored; an open
+bump PR without state must be initialized before accepting new requests.
 
 Run `npm test` to test the queue and handoff behavior without GitHub writes.
 

@@ -37,19 +37,17 @@ function initialState (version, pending = [], predecessor = null) {
   return { schema: 1, version, pending, predecessor, successor: null }
 }
 
-function legacyVersion (pr) {
-  const version = /boilerplate for Minecraft version ([\w.-]+)\./.exec(pr.body)?.[1] ||
-    /^🎈 Add version ([\w.-]+)$/.exec(pr.title)?.[1]
-  if (!version) throw new Error(`Cannot determine the version of bump PR #${pr.number}`)
-  return version
-}
-
 // All callers must share the workflow's concurrency group. Reconcile the latest
 // PR, rather than the event snapshot: close events and dispatches can arrive late.
 async function runQueue ({ api, supported, request }) {
-  const pulls = (await api.list()).sort((a, b) => a.number - b.number)
+  const allPulls = await api.list()
+  for (const pr of allPulls) {
+    pr.queue = readState(pr.body)
+    if (!pr.queue && pr.state === 'open') throw new Error(`Initialize WF_STATE on bump PR #${pr.number} before continuing`)
+  }
+  // Old closed PRs predate this queue. Migration is a one-time state update.
+  const pulls = allPulls.filter(pr => pr.queue).sort((a, b) => a.number - b.number)
   if (pulls.filter(pr => pr.state === 'open').length > 1) throw new Error('Multiple open bump PRs')
-  for (const pr of pulls) pr.queue = readState(pr.body) || initialState(legacyVersion(pr))
 
   async function save (pr) {
     // Preserve description edits made since the list request.
