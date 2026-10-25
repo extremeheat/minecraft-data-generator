@@ -15,7 +15,9 @@ function fixture (initial = []) {
   const pulls = structuredClone(initial)
   const created = []
   const updates = []
+  let supportedVersions
   const api = {
+    prepare: async () => supportedVersions,
     list: async () => structuredClone(pulls),
     get: async number => structuredClone(pulls.find(pr => pr.number === number)),
     update: async (number, body) => {
@@ -35,7 +37,10 @@ function fixture (initial = []) {
     pulls,
     created,
     updates,
-    run: (next, supported = ['26.2']) => runQueue({ api, request: next, supported }),
+    run: (next, supported = ['26.2']) => {
+      supportedVersions = supported
+      return runQueue({ api, request: next, supported })
+    },
     state: number => readState(pulls.find(pr => pr.number === number).body)
   }
 }
@@ -105,6 +110,54 @@ test('an empty queue or already supported queued version creates nothing', async
   const f = fixture([pull(1, '26.3', [request('26.4')], 'closed')])
   await f.run(null, ['26.2', '26.3', '26.4'])
   await f.run()
+  assert.equal(f.created.length, 0)
+})
+
+test('refreshes after observing closure and removes versions newly supported on main', async () => {
+  const f = fixture([pull(1, '26.3', [request('26.4'), request('26.5')], 'closed')])
+  let listed = false
+  const list = f.api.list
+  f.api.list = async () => {
+    listed = true
+    return list()
+  }
+  f.api.prepare = async () => {
+    assert.equal(listed, true)
+    return ['26.2', '26.3', '26.4']
+  }
+  await f.run(null, ['26.2']) // Workflow checkout predates the merge.
+  assert.equal(f.created.length, 1)
+  assert.equal(f.created[0].version, '26.5')
+  assert.deepEqual(f.state(1).pending, [request('26.5')])
+})
+
+test('refresh can consume the entire queue without creating a successor', async () => {
+  const f = fixture([pull(1, '26.3', [request('26.4')], 'closed')])
+  f.api.prepare = async () => ['26.2', '26.3', '26.4']
+  await f.run()
+  assert.equal(f.created.length, 0)
+  assert.deepEqual(f.state(1).pending, [])
+})
+
+test('a first request already present on refreshed main does not create a PR', async () => {
+  const f = fixture()
+  f.api.prepare = async () => ['26.2', '26.3']
+  await f.run(request('26.3'), ['26.2'])
+  assert.equal(f.created.length, 0)
+})
+
+test('an open PR only queues requests without checking out a new branch', async () => {
+  const f = fixture([pull(1, '26.3')])
+  f.api.prepare = async () => { throw new Error('Must not prepare while open') }
+  await f.run(request('26.4'))
+  assert.deepEqual(f.state(1).pending, [request('26.4')])
+})
+
+test('a failed refresh retains arrivals for the next attempt', async () => {
+  const f = fixture([pull(1, '26.3', [request('26.4')], 'closed')])
+  f.api.prepare = async () => { throw new Error('Fetch failed') }
+  await assert.rejects(f.run(request('26.5')), /Fetch failed/)
+  assert.deepEqual(f.state(1).pending, [request('26.4'), request('26.5')])
   assert.equal(f.created.length, 0)
 })
 

@@ -1,9 +1,29 @@
 const cp = require('child_process')
+const fs = require('fs')
 const { runQueue, writeState } = require('./bump-state')
 
 const git = (...args) => {
   console.log('$ git', ...args)
   cp.execFileSync('git', args, { stdio: 'inherit' })
+}
+
+const readSupported = () => JSON.parse(fs.readFileSync('versions.json', 'utf8'))
+
+function prepareBumpBranch () {
+  git('fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main')
+  git('checkout', '-B', 'bump-next', 'refs/remotes/origin/main')
+  return readSupported()
+}
+
+function createBumpCommit (version) {
+  // Run the freshly checked-out tool in a new process, without cached modules
+  // or a versions.json loaded before the predecessor merged.
+  cp.execFileSync(process.execPath, ['tools/newVersion.js', version], { stdio: 'inherit' })
+  git('config', 'user.name', 'github-actions[bot]')
+  git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+  git('add', 'mc', 'versions.json')
+  git('commit', '-m', `Add version ${version}`)
+  git('push', 'origin', 'HEAD:refs/heads/bump', '--force')
 }
 
 const generateBody = ({ version, issue, pr }) => `
@@ -48,23 +68,18 @@ module.exports = async ([newVersion], helpers) => {
 
   try {
     await runQueue({
-      supported: require('../../versions.json'),
+      supported: readSupported(),
       request,
       api: {
         list: async () => (await listBumpPulls()).filter(pr => isBumpPull(pr, repository)),
         get: number => gh.getPullRequest(number),
         update: (number, body) => gh.updatePull(number, { body }),
+        prepare: prepareBumpBranch,
         create: async (next, state) => {
           validateRequest(next)
           // Never reset a branch that still has an open PR with contributor work.
           if ((await listBumpPulls()).some(pr => pr.state === 'open')) throw new Error('A bump PR is already open')
-          require('../../tools/newVersion')(next.version)
-          git('checkout', '-B', 'bump')
-          git('config', 'user.name', 'github-actions[bot]')
-          git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
-          git('add', 'mc', 'versions.json')
-          git('commit', '-m', `Add version ${next.version}`)
-          git('push', 'origin', 'bump', '--force')
+          createBumpCommit(next.version)
           const pr = await gh.createPullRequest(`🎈 Add version ${next.version}`, writeState(generateBody(next), state), 'bump', 'main')
           console.log('Pull request created:', pr.url)
           return pr
@@ -78,6 +93,8 @@ module.exports = async ([newVersion], helpers) => {
 }
 
 module.exports.isBumpPull = isBumpPull
+module.exports.prepareBumpBranch = prepareBumpBranch
+module.exports.createBumpCommit = createBumpCommit
 
 if (require.main === module) {
   const args = process.argv.slice(2)

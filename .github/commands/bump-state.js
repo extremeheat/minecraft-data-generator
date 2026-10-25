@@ -71,7 +71,10 @@ async function runQueue ({ api, supported, request }) {
   if (request && handled.has(request.version)) request = null
   const latest = pulls.at(-1)
   if (!latest) {
-    if (request) await api.create(request, initialState(request.version))
+    if (request) {
+      const refreshed = await api.prepare()
+      if (!refreshed.includes(request.version)) await api.create(request, initialState(request.version))
+    }
     return
   }
   if (pulls.some(pr => pr.state === 'open' && pr !== latest)) throw new Error('An older bump PR is still open')
@@ -88,6 +91,16 @@ async function runQueue ({ api, supported, request }) {
   const currentState = readState(latest.body)
   if (JSON.stringify(currentState) !== JSON.stringify(latest.queue)) await save(latest)
   if (latest.state === 'open' || !latest.queue.pending.length) return
+
+  // A PR may have merged after the workflow's initial checkout. Only now that
+  // closure is observed, refresh main and reconcile against its actual manifest.
+  const refreshed = await api.prepare()
+  const pending = latest.queue.pending.filter(item => !refreshed.includes(item.version))
+  if (pending.length !== latest.queue.pending.length) {
+    latest.queue.pending = pending
+    await save(latest)
+  }
+  if (!pending.length) return
 
   const [next, ...remaining] = latest.queue.pending
   const successor = await api.create(next, initialState(next.version, remaining, latest.number))
